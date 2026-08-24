@@ -81,6 +81,7 @@ Short complete → `/rotate-short` with `"side": "short"`.
 
 ## Deploy
 
+
 ```bash
 git clone https://github.com/ballzac81/IADSS-Rotation-Tracker.git
 cd IADSS-Rotation-Tracker
@@ -101,11 +102,34 @@ docker compose -f docker-compose.selfhosted.yml up -d
 cd /mnt/user/appdata/IADSS-Rotation-Tracker && docker compose -f docker-compose.selfhosted.yml up -d
 ```
 
+### Portainer (Unraid)
+
+1. Portainer → **Stacks** → **Add stack**
+2. Build method: **Repository**
+3. Repository URL: `https://github.com/ballzac81/IADSS-Rotation-Tracker.git`
+4. Compose path: `docker-compose.portainer.yml`
+5. **Environment variables** in the UI (same names as `.env.example`):
+
+| Required | Example |
+|----------|---------|
+| `DOCKER_NETWORK` | the tunnel network IADSS already uses |
+| `SECRET_TOKEN` | `openssl rand -hex 24` |
+| `HL_AGENT_PRIVATE_KEY` | agent wallet key |
+| `HL_ACCOUNT_ADDRESS` | master `0x…` |
+| `HL_SUBACCOUNT_ADDRESS` | `HYPE-SOL-rotate` `0x…` |
+| `DRY_RUN` | `true` until you have watched `/preview` |
+
+Optional: `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, `HL_SPOT_QUOTE=USOL/USDC`
+
+6. Deploy the stack. Portainer builds the image from the Dockerfile.
+
+Cloudflare (same tunnel as IADSS, new hostname):
+
 ```
 rotate.yourdomain.com  →  http://rotation-tracker:5000
 ```
 
-Host port `5002` so it does not clash with IADSS (`5000`) or PTOS (`5001`).
+Host port `5002` so it does not clash with IADSS (`5000`) or PTOS (`5001`). Data lives in the named volume `rotation-data` (Portainer → Volumes). To bind it to Unraid appdata instead, change the volume to `/mnt/user/appdata/IADSS-Rotation-Tracker/data:/data`.
 
 Keep `DRY_RUN=true` until `/preview` and Telegram look right. Then set `DRY_RUN=false` and recreate the container.
 

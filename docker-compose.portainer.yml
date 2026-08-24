@@ -1,0 +1,52 @@
+# Portainer stack (Unraid).
+# Stacks → Add stack → Repository
+#   Repository URL: https://github.com/ballzac81/IADSS-Rotation-Tracker.git
+#   Compose path:   docker-compose.portainer.yml
+# Then fill the stack environment variables in the Portainer UI.
+#
+# DOCKER_NETWORK must be the same network as your Cloudflare tunnel / IADSS.
+
+services:
+  rotation-tracker:
+    build: .
+    image: iadss-rotation-tracker:local
+    container_name: rotation-tracker
+    restart: unless-stopped
+    networks:
+      - tunnel_network
+    ports:
+      - "5002:5000"
+    environment:
+      SECRET_TOKEN: ${SECRET_TOKEN}
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      HL_AGENT_PRIVATE_KEY: ${HL_AGENT_PRIVATE_KEY}
+      HL_ACCOUNT_ADDRESS: ${HL_ACCOUNT_ADDRESS}
+      HL_SUBACCOUNT_ADDRESS: ${HL_SUBACCOUNT_ADDRESS:-}
+      HL_NETWORK: ${HL_NETWORK:-mainnet}
+      DRY_RUN: ${DRY_RUN:-true}
+      ROTATE_BASE: ${ROTATE_BASE:-HYPE}
+      ROTATE_QUOTE: ${ROTATE_QUOTE:-SOL}
+      STAKE_CURRENCY: ${STAKE_CURRENCY:-USDC}
+      ROTATE_RATIO: ${ROTATE_RATIO:-0.5}
+      MIN_STAKE: ${MIN_STAKE:-10}
+      FEE_BPS: ${FEE_BPS:-0}
+      SLIPPAGE: ${SLIPPAGE:-0.01}
+      HL_SPOT_BASE: ${HL_SPOT_BASE:-}
+      HL_SPOT_QUOTE: ${HL_SPOT_QUOTE:-}
+      SETTLE_TIMEOUT: ${SETTLE_TIMEOUT:-30}
+    volumes:
+      - rotation-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  rotation-data:
+
+networks:
+  tunnel_network:
+    name: ${DOCKER_NETWORK}
+    external: true
