@@ -1,8 +1,8 @@
 # IADSS Rotation Tracker
 
-Pair rotator for the [IADSS Confluence Monitor](https://www.tradingview.com/script/GzeIM5db-IADSS-Confluence-Monitor/). Same webhook / Telegram / Unraid style as [IADSS-Signal-Tracker](https://github.com/ballzac81/IADSS-Signal-Tracker), but a **separate Freqtrade** on a **Kraken subaccount**.
+Pair rotator for the [IADSS Confluence Monitor](https://www.tradingview.com/script/GzeIM5db-IADSS-Confluence-Monitor/). Same webhook / Telegram / Unraid style as [IADSS-Signal-Tracker](https://github.com/ballzac81/IADSS-Signal-Tracker), but it trades **Hyperliquid spot** on its **own subaccount**.
 
-IADSS keeps SOL, HYPE, and TAO independent on the main account. This repo is only the HYPE/SOL rotation sleeve.
+Leave Kraken IADSS (SOL / HYPE / TAO) and PTOS (HL perps) exactly as they are.
 
 > **Spot only. Never shorts.** Long/Short is the ratio direction, not a leveraged short.
 
@@ -12,29 +12,41 @@ Chart the ratio (example: `HYPEUSD/SOLUSD` on TradingView). When IADSS completes
 
 | Signal | Meaning | Action (default 50%) |
 |--------|---------|----------------------|
-| **Long** | Base (HYPE) is stronger | Sell 50% of **SOL USD value** → buy HYPE with the proceeds |
-| **Short** | Quote (SOL) is stronger | Sell 50% of **HYPE USD value** → buy SOL with the proceeds |
+| **Long** | Base (HYPE) is stronger | Sell 50% of **SOL USD value** → buy HYPE with the USDC |
+| **Short** | Quote (SOL) is stronger | Sell 50% of **HYPE USD value** → buy SOL with the USDC |
 
-Sizing is always **USD of the weaker side**, not token count.
-
-Example starting book: `$5,000 HYPE` + `$5,000 SOL`.
-
-1. Long → sell `$2,500` of SOL, buy `$2,500` of HYPE → about `$7,500 HYPE` / `$2,500 SOL`
-2. Long again → sell `$1,250` of remaining SOL → about `$8,750 HYPE` / `$1,250 SOL`
-3. Short → sell `$4,375` of HYPE → about `$4,375 HYPE` / `$5,625 SOL`
-
-You stay long both the whole time. Only the mix changes.
+Sizing is always **USD of the weaker side**, not token count. You stay long both.
 
 ## Keep the books separate
 
-| Sleeve | Kraken | Freqtrade | Signals |
-|--------|--------|-----------|---------|
-| IADSS independent | Main account | Existing `freqtrade` | SOL / HYPE / TAO pair alerts |
-| HYPE/SOL rotation | **Subaccount** | `rotation-freqtrade` (this repo) | Ratio-chart Long / Short only |
+| Sleeve | Where | What |
+|--------|--------|------|
+| IADSS independent | Kraken business + existing Freqtrade | SOL / HYPE / TAO pair alerts |
+| PTOS | Existing Hyperliquid account/sub | Perps — do not reuse |
+| **HYPE/SOL rotation** | **New HL subaccount** `HYPE-SOL-rotate` | This bot, spot only |
 
-Kraken extra API keys on the **same** account still share balances. Subaccounts do not.
+## Hyperliquid setup (same idea as PTOS)
 
-Do **not** run `docker-compose.sidecar.yml` against live IADSS. That file is left only as a warning.
+1. [app.hyperliquid.xyz/subAccounts](https://app.hyperliquid.xyz/subAccounts) → create `HYPE-SOL-rotate`.
+2. Send **spot** HYPE and SOL (or USDC) into that sub. Use spot send, not perps USDC.
+3. [app.hyperliquid.xyz/API](https://app.hyperliquid.xyz/API) → generate an **agent wallet** authorized for that sub. Trading only, no withdraw.
+4. In Trade UI, switch to the sub, open **Spot**, confirm `HYPE/USDC` and `SOL/USDC` (SOL may show as USOL).
+
+`.env`:
+
+```
+HL_AGENT_PRIVATE_KEY=          # agent private key
+HL_ACCOUNT_ADDRESS=            # master wallet you connect in the UI
+HL_SUBACCOUNT_ADDRESS=         # 0x… of HYPE-SOL-rotate
+DRY_RUN=true
+```
+
+SOL on HL spot is often `USOL`. If `/preview` cannot resolve it:
+
+```
+HL_SPOT_QUOTE=USOL/USDC
+HL_SPOT_BASE=HYPE/USDC
+```
 
 ## Endpoints
 
@@ -46,23 +58,20 @@ Do **not** run `docker-compose.sidecar.yml` against live IADSS. That file is lef
 | `/rotate-short` | POST | Execute Short rotation |
 | `/rotate` | POST | Body `{"side":"long"}` or `"short"` |
 | `/preview?side=long` | GET | Dry preview of the next rotation |
-| `/book` | GET | Live Freqtrade weights + local book |
-| `/book/seed` | POST | Record starting coins (`symbol`, `coins`, `cost_usd`) |
+| `/book` | GET | Live HL spot weights + local book |
+| `/book/sync` | POST | Seed book from live HL balances |
+| `/book/seed` | POST | Manual seed (`symbol`, `coins`, `cost_usd`) |
 | `/health` | GET | No auth |
 
-Auth is the same as IADSS: `token` in JSON body (preferred), `?token=`, or `X-Token` / `X-Webhook-Secret`.
+Auth: `token` in JSON body (preferred), `?token=`, or `X-Token` / `X-Webhook-Secret`.
 
 ## TradingView alerts
 
-Four alerts on the **ratio chart**, once per bar close. Leave IADSS pair alerts on SOL/HYPE/TAO pointed at the original tracker.
-
-Webhook URL (Long complete):
+Four alerts on the **ratio chart**, once per bar close. IADSS pair alerts stay pointed at the original Kraken tracker.
 
 ```
 https://rotate.yourdomain.com/rotate-long
 ```
-
-Message body:
 
 ```json
 {"pair": "HYPE/SOL", "token": "YOUR_SECRET_TOKEN", "side": "long"}
@@ -70,35 +79,17 @@ Message body:
 
 Short complete → `/rotate-short` with `"side": "short"`.
 
-## Setup (Kraken subaccount)
-
-1. On Kraken, create a subaccount. Generate an API key with **Query** + **Create and modify orders** only (never withdrawals).
-2. Transfer in only the rotation bankroll.
-3. Clone and configure:
+## Deploy
 
 ```bash
 git clone https://github.com/ballzac81/IADSS-Rotation-Tracker.git
 cd IADSS-Rotation-Tracker
 cp .env.example .env
-mkdir -p user_data/strategies
-cp config.json user_data/
-cp strategies/WebhookStrategy.py user_data/strategies/
-```
-
-4. Edit `user_data/config.json`:
-   - Subaccount API key and secret
-   - `"dry_run": true` until you have watched rotations
-   - JWT secret, Freqtrade API password (must match `FREQTRADE_PASS` in `.env`)
-   - `pair_whitelist`: `HYPE/USD`, `SOL/USD` only
-5. Generate `SECRET_TOKEN` (`openssl rand -hex 24`) and put it in `.env`.
-
-VPS:
-
-```bash
+# fill SECRET_TOKEN, HL_* keys, TELEGRAM_*, keep DRY_RUN=true
 docker compose up -d
 ```
 
-Unraid (own Freqtrade, Cloudflare tunnel for HTTPS only):
+Unraid (Cloudflare tunnel for HTTPS):
 
 ```bash
 docker compose -f docker-compose.selfhosted.yml up -d
@@ -110,48 +101,42 @@ docker compose -f docker-compose.selfhosted.yml up -d
 cd /mnt/user/appdata/IADSS-Rotation-Tracker && docker compose -f docker-compose.selfhosted.yml up -d
 ```
 
-Cloudflare public hostnames (same tunnel as IADSS, **different containers**):
-
 ```
-rotate.yourdomain.com        →  http://rotation-tracker:5000
-rotate-trade.yourdomain.com  →  http://rotation-freqtrade:8080
+rotate.yourdomain.com  →  http://rotation-tracker:5000
 ```
 
-Ports `5002` (tracker) and `8068` (Freqtrade UI) so they do not clash with IADSS.
+Host port `5002` so it does not clash with IADSS (`5000`) or PTOS (`5001`).
 
-## Seed existing holdings
+Keep `DRY_RUN=true` until `/preview` and Telegram look right. Then set `DRY_RUN=false` and recreate the container.
 
-This Freqtrade must have **open trades** on both pairs for sells to work. After a starter buy on each side in dry-run:
+Sync the book from live HL spot:
 
 ```bash
-curl -X POST https://rotate.yourdomain.com/book/seed \
+curl -X POST https://rotate.yourdomain.com/book/sync \
   -H "Content-Type: application/json" \
-  -d '{"symbol":"HYPE","coins":12.5,"cost_usd":1000,"token":"YOUR_SECRET_TOKEN"}'
-```
-
-```bash
-curl "https://rotate.yourdomain.com/preview?side=long&token=YOUR_SECRET_TOKEN"
+  -d '{"token":"YOUR_SECRET_TOKEN"}'
 ```
 
 ## Environment
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
+| `DRY_RUN` | `true` | If true, sizes and Telegram fire but no HL orders |
 | `ROTATE_BASE` | `HYPE` | Asset bought on Long |
 | `ROTATE_QUOTE` | `SOL` | Asset bought on Short |
-| `STAKE_CURRENCY` | `USD` | Freqtrade stake currency |
+| `STAKE_CURRENCY` | `USDC` | HL spot quote |
 | `ROTATE_RATIO` | `0.5` | Fraction of the weaker side's **USD** sold |
 | `MIN_STAKE` | `10` | Skip if the USD slice is below this |
-| `FEE_BPS` | `0` | Optional haircut before the buy (16 = 0.16%) |
-| `SETTLE_TIMEOUT` | `60` | Seconds to wait for the sell to credit free cash |
+| `SLIPPAGE` | `0.01` | IOC market slippage (1%) |
+| `FEE_BPS` | `0` | Optional haircut before the buy |
 
 ## Security
 
 - Trade endpoints require `SECRET_TOKEN`
 - Rate limit: 6/min on rotate, 30/min on early warning
-- Never enable withdrawal permissions on the exchange key
+- Use an **agent wallet** (cannot withdraw)
 - `.env` is gitignored
-- One Freqtrade per Kraken account/subaccount
+- Do not reuse the PTOS subaccount (unified USDC is one pot on that sub)
 
 ## License
 
@@ -159,4 +144,4 @@ MIT — see [LICENSE](LICENSE).
 
 ## Disclaimer
 
-Educational software, not financial advice. You are solely responsible for trades. Test in dry-run first. Never trade money you cannot afford to lose.
+Educational software, not financial advice. You are solely responsible for trades. Test with `DRY_RUN=true` first. Never trade money you cannot afford to lose.

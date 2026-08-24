@@ -2,3 +2,5 @@ flask==3.0.*
 flask-limiter==3.*
 requests==2.*
 gunicorn==23.*
+hyperliquid-python-sdk>=0.18.0
+eth-account>=0.13.0

@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""IADSS Rotation Tracker — pair rotator for two spot assets.
+"""IADSS Rotation Tracker — Hyperliquid spot rotator.
 
-Based on IADSS-Signal-Tracker. TradingView fires Long/Short on a ratio chart
-(e.g. HYPEUSD/SOLUSD). This server rotates USD value between the two assets:
+TradingView fires Long/Short on a ratio chart (e.g. HYPEUSD/SOLUSD).
+This server rotates USD value between two spot assets on a dedicated
+Hyperliquid subaccount:
 
   Long  = base stronger  → sell ROTATE_RATIO of quote USD → buy base
   Short = quote stronger → sell ROTATE_RATIO of base USD  → buy quote
 
-Never shorts. Both assets stay long; only the weighting changes.
-
-Default: HYPE/SOL, 50% of the weaker side's current USD value.
+Never shorts. Never talks to Kraken / Freqtrade / IADSS.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -32,30 +32,28 @@ from flask_limiter.util import get_remote_address
 PAIR_RE = re.compile(r"^[A-Z0-9]+/[A-Z0-9]+$")
 SIDE_RE = re.compile(r"^(long|short)$", re.I)
 
-
-def valid_pair(pair: str) -> bool:
-    return bool(PAIR_RE.match(pair))
-
-
 SECRET_TOKEN = os.environ.get("SECRET_TOKEN", "")
-FREQTRADE_API = os.environ.get("FREQTRADE_API", "http://rotation-freqtrade:8080/api/v1")
-FREQTRADE_USER = os.environ.get("FREQTRADE_USER", "admin")
-FREQTRADE_PASS = os.environ.get("FREQTRADE_PASS", "")
 TG_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 ROTATE_BASE = os.environ.get("ROTATE_BASE", "HYPE").upper()
 ROTATE_QUOTE = os.environ.get("ROTATE_QUOTE", "SOL").upper()
-STAKE_CURRENCY = os.environ.get("STAKE_CURRENCY", "USD").upper()
+STAKE_CURRENCY = os.environ.get("STAKE_CURRENCY", "USDC").upper()
 ROTATE_RATIO = float(os.environ.get("ROTATE_RATIO", "0.5"))
 MIN_STAKE = float(os.environ.get("MIN_STAKE", "10.0"))
 FEE_BPS = float(os.environ.get("FEE_BPS", "0"))
-SETTLE_TIMEOUT = float(os.environ.get("SETTLE_TIMEOUT", "60"))
-SETTLE_POLL = float(os.environ.get("SETTLE_POLL", "2.0"))
+SLIPPAGE = float(os.environ.get("SLIPPAGE", "0.01"))
+SETTLE_TIMEOUT = float(os.environ.get("SETTLE_TIMEOUT", "30"))
+SETTLE_POLL = float(os.environ.get("SETTLE_POLL", "1.5"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() in ("1", "true", "yes", "on")
 
-API_RETRIES = int(os.environ.get("API_RETRIES", "3"))
-API_RETRY_DELAY = float(os.environ.get("API_RETRY_DELAY", "5.0"))
-API_TIMEOUT = int(os.environ.get("API_TIMEOUT", "20"))
+HL_AGENT_PRIVATE_KEY = (os.environ.get("HL_AGENT_PRIVATE_KEY") or os.environ.get("HL_SECRET_KEY") or "").strip()
+HL_ACCOUNT_ADDRESS = (os.environ.get("HL_ACCOUNT_ADDRESS") or "").strip()
+HL_SUBACCOUNT_ADDRESS = (os.environ.get("HL_SUBACCOUNT_ADDRESS") or "").strip()
+HL_NETWORK = (os.environ.get("HL_NETWORK") or "mainnet").strip().lower()
+HL_SPOT_BASE = os.environ.get("HL_SPOT_BASE", "").strip()
+HL_SPOT_QUOTE = os.environ.get("HL_SPOT_QUOTE", "").strip()
+
 BOOK_FILE = os.environ.get("BOOK_FILE", "/data/rotation_book.json")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -63,22 +61,28 @@ logger = logging.getLogger(__name__)
 
 if not SECRET_TOKEN:
     logger.warning("SECRET_TOKEN is not set — endpoints are UNAUTHENTICATED")
+if DRY_RUN:
+    logger.warning("DRY_RUN=true — orders will NOT be sent to Hyperliquid")
 
 app = Flask(__name__)
 limiter = Limiter(get_remote_address, app=app, default_limits=[], storage_uri="memory://")
 _book_lock = threading.Lock()
-
-
-def base_pair() -> str:
-    return f"{ROTATE_BASE}/{STAKE_CURRENCY}"
-
-
-def quote_pair() -> str:
-    return f"{ROTATE_QUOTE}/{STAKE_CURRENCY}"
+_hl_lock = threading.Lock()
+_hl = None
 
 
 def ratio_pair() -> str:
     return f"{ROTATE_BASE}/{ROTATE_QUOTE}"
+
+
+def trading_address() -> str:
+    return HL_SUBACCOUNT_ADDRESS or HL_ACCOUNT_ADDRESS
+
+
+def hl_base_url() -> str:
+    from hyperliquid.utils import constants
+
+    return constants.TESTNET_API_URL if HL_NETWORK == "testnet" else constants.MAINNET_API_URL
 
 
 def telegram(msg: str):
@@ -94,26 +98,218 @@ def telegram(msg: str):
         logger.warning("Telegram failed: %s", e)
 
 
-def _ft_request(method: str, endpoint: str, **kwargs) -> dict | list:
-    url = f"{FREQTRADE_API}/{endpoint.lstrip('/')}"
-    auth = (FREQTRADE_USER, FREQTRADE_PASS)
-    last_error = None
-    for attempt in range(1, API_RETRIES + 1):
+def _init_hl():
+    if not HL_AGENT_PRIVATE_KEY or not HL_ACCOUNT_ADDRESS:
+        raise RuntimeError("HL_AGENT_PRIVATE_KEY and HL_ACCOUNT_ADDRESS are required")
+    from eth_account import Account
+    from hyperliquid.exchange import Exchange
+    from hyperliquid.info import Info
+
+    key = HL_AGENT_PRIVATE_KEY
+    if not key.startswith("0x"):
+        key = "0x" + key
+    wallet = Account.from_key(key)
+    account = HL_ACCOUNT_ADDRESS
+    if not account.startswith("0x"):
+        account = "0x" + account
+    vault = HL_SUBACCOUNT_ADDRESS or None
+    if vault and not vault.startswith("0x"):
+        vault = "0x" + vault
+    url = hl_base_url()
+    info = Info(url, skip_ws=True)
+    exchange = Exchange(
+        wallet,
+        url,
+        account_address=account,
+        vault_address=vault,
+    )
+    logger.info(
+        "Hyperliquid ready network=%s agent=%s account=%s vault=%s",
+        HL_NETWORK,
+        wallet.address,
+        account,
+        vault or "none",
+    )
+    return {"info": info, "exchange": exchange, "account": account, "vault": vault}
+
+
+def hl():
+    global _hl
+    with _hl_lock:
+        if _hl is None:
+            _hl = _init_hl()
+        return _hl
+
+
+def query_address() -> str:
+    addr = trading_address()
+    if not addr:
+        raise RuntimeError("HL_SUBACCOUNT_ADDRESS or HL_ACCOUNT_ADDRESS is required")
+    return addr if addr.startswith("0x") else "0x" + addr
+
+
+def _token_aliases(symbol: str) -> list[str]:
+    s = symbol.upper()
+    names = [s, f"U{s}", f"{s}/USDC", f"U{s}/USDC"]
+    extra = os.environ.get(f"HL_SPOT_{s}", "").strip()
+    if extra:
+        names.insert(0, extra)
+    return names
+
+
+def spot_name(symbol: str) -> str:
+    if symbol.upper() == ROTATE_BASE and HL_SPOT_BASE:
+        return HL_SPOT_BASE
+    if symbol.upper() == ROTATE_QUOTE and HL_SPOT_QUOTE:
+        return HL_SPOT_QUOTE
+    info = hl()["info"]
+    for candidate in _token_aliases(symbol):
+        if candidate in info.name_to_coin:
+            return candidate
+    raise RuntimeError(
+        f"could not resolve Hyperliquid spot market for {symbol}. "
+        f"Set HL_SPOT_{symbol.upper()} (e.g. USOL/USDC)"
+    )
+
+
+def mid_px(symbol: str) -> float:
+    info = hl()["info"]
+    name = spot_name(symbol)
+    coin = info.name_to_coin[name]
+    mids = info.all_mids()
+    px = float(mids.get(coin) or mids.get(name) or 0)
+    if px <= 0:
+        raise RuntimeError(f"no mid price for {symbol} ({name})")
+    return px
+
+
+def sz_decimals(symbol: str) -> int:
+    info = hl()["info"]
+    name = spot_name(symbol)
+    coin = info.name_to_coin[name]
+    asset = info.coin_to_asset[coin]
+    return int(info.asset_to_sz_decimals[asset])
+
+
+def round_sz(sz: float, decimals: int, up: bool = False) -> float:
+    factor = 10 ** decimals
+    if up:
+        return math.ceil(sz * factor - 1e-12) / factor
+    return math.floor(sz * factor + 1e-12) / factor
+
+
+def spot_balances() -> dict[str, dict]:
+    state = hl()["info"].spot_user_state(query_address())
+    out = {}
+    for row in state.get("balances") or []:
+        coin = str(row.get("coin") or "").upper()
+        total = float(row.get("total") or 0)
+        hold = float(row.get("hold") or 0)
+        out[coin] = {
+            "total": total,
+            "hold": hold,
+            "free": max(0.0, total - hold),
+            "entry_ntl": float(row.get("entryNtl") or 0),
+            "raw": row,
+        }
+    return out
+
+
+def balance_of(symbol: str) -> dict:
+    bals = spot_balances()
+    for key in _token_aliases(symbol):
+        bare = key.split("/")[0].upper()
+        if bare in bals:
+            return bals[bare]
+    return {"total": 0.0, "hold": 0.0, "free": 0.0, "entry_ntl": 0.0}
+
+
+def position(symbol: str) -> tuple[float, float]:
+    """(free coins, usd value at mid)."""
+    bal = balance_of(symbol)
+    coins = float(bal["free"])
+    if coins <= 0:
+        return 0.0, 0.0
+    return coins, coins * mid_px(symbol)
+
+
+def usdc_free() -> float:
+    return float(balance_of(STAKE_CURRENCY)["free"])
+
+
+def wait_until(predicate, timeout: float, label: str) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         try:
-            resp = requests.request(method, url, auth=auth, timeout=API_TIMEOUT, **kwargs)
-            resp.raise_for_status()
-            return resp.json()
+            if predicate():
+                return True
         except Exception as e:
-            last_error = e
-            logger.warning("Freqtrade API attempt %d/%d failed: %s", attempt, API_RETRIES, e)
-            if attempt < API_RETRIES:
-                time.sleep(API_RETRY_DELAY)
-    raise RuntimeError(f"Freqtrade API failed after {API_RETRIES} attempts: {last_error}")
+            logger.warning("Settle poll (%s) error: %s", label, e)
+        time.sleep(SETTLE_POLL)
+    return False
+
+
+def parse_order_result(result: dict) -> dict:
+    if not isinstance(result, dict):
+        return {"raw": result}
+    if result.get("status") != "ok":
+        raise RuntimeError(f"Hyperliquid order failed: {result}")
+    statuses = (((result.get("response") or {}).get("data") or {}).get("statuses")) or []
+    if not statuses:
+        return {"raw": result}
+    status = statuses[0]
+    if "error" in status:
+        raise RuntimeError(f"Hyperliquid order error: {status['error']}")
+    return {"status": status, "raw": result}
+
+
+def market_spot(symbol: str, is_buy: bool, sz: float) -> dict:
+    name = spot_name(symbol)
+    sz = round_sz(sz, sz_decimals(symbol), up=False)
+    if sz <= 0:
+        raise RuntimeError(f"rounded size is 0 for {symbol}")
+    logger.info("HL %s %s sz=%s name=%s dry_run=%s", "BUY" if is_buy else "SELL", symbol, sz, name, DRY_RUN)
+    if DRY_RUN:
+        px = mid_px(symbol)
+        return {"dry_run": True, "name": name, "sz": sz, "px": px, "usd": sz * px}
+    result = hl()["exchange"].market_open(name, is_buy, sz, None, SLIPPAGE)
+    parsed = parse_order_result(result)
+    parsed.update({"name": name, "sz": sz})
+    return parsed
+
+
+def sell_usd(symbol: str, target_usd: float) -> dict:
+    coins, usd = position(symbol)
+    if coins <= 0 or usd <= 0:
+        raise RuntimeError(f"no free {symbol} spot to sell")
+    px = mid_px(symbol)
+    want_coins = min(coins, target_usd / px)
+    if want_coins / coins > 0.97:
+        want_coins = coins
+    sold = market_spot(symbol, False, want_coins)
+    sold_coins = float(sold.get("sz") or want_coins)
+    sold_usd = sold_coins * px
+    return {"sold_coins": sold_coins, "sold_usd": sold_usd, "px": px, "fill": sold}
+
+
+def buy_usd(symbol: str, stake: float) -> dict:
+    if stake < MIN_STAKE:
+        raise RuntimeError(f"buy stake ${stake:.2f} below ${MIN_STAKE:.0f} minimum")
+    px = mid_px(symbol)
+    cash = usdc_free()
+    use = min(stake, cash) if not DRY_RUN else stake
+    if use < MIN_STAKE:
+        raise RuntimeError(f"free {STAKE_CURRENCY} ${cash:.2f} too low to buy {symbol}")
+    sz = use / (px * (1 + SLIPPAGE))
+    filled = market_spot(symbol, True, sz)
+    bought_usd = float(filled.get("sz") or sz) * px
+    return {"bought_usd": bought_usd, "sz": filled.get("sz"), "px": px, "fill": filled}
 
 
 def _empty_book() -> dict:
     now = datetime.now(timezone.utc).isoformat()
     return {
+        "venue": "hyperliquid",
         "base": ROTATE_BASE,
         "quote": ROTATE_QUOTE,
         "stake": STAKE_CURRENCY,
@@ -137,6 +333,7 @@ def _load_book() -> dict:
             data["assets"].setdefault(ROTATE_BASE, {"coins": 0.0, "cost_usd": 0.0})
             data["assets"].setdefault(ROTATE_QUOTE, {"coins": 0.0, "cost_usd": 0.0})
             data.setdefault("history", [])
+            data["venue"] = "hyperliquid"
             return data
         except Exception as e:
             logger.error("Failed to load book: %s", e)
@@ -157,127 +354,6 @@ def _save_book(book: dict):
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
-
-
-def get_open_trades(pair: str) -> list[dict]:
-    data = _ft_request("GET", "/status")
-    if not isinstance(data, list):
-        return []
-    trades = [t for t in data if t.get("pair") == pair and t.get("is_open")]
-    return sorted(trades, key=lambda t: t.get("open_date", ""), reverse=True)
-
-
-def trade_rate(trade: dict) -> float:
-    rate = trade.get("current_rate")
-    if rate:
-        return float(rate)
-    return float(trade.get("open_rate") or 0)
-
-
-def position_usd(pair: str) -> tuple[list[dict], float, float]:
-    trades = get_open_trades(pair)
-    coins = 0.0
-    usd = 0.0
-    for t in trades:
-        amt = float(t.get("amount") or 0)
-        rate = trade_rate(t)
-        coins += amt
-        usd += amt * rate
-    return trades, coins, usd
-
-
-def get_available_capital() -> float:
-    data = _ft_request("GET", "/balance")
-    if not isinstance(data, dict):
-        return 0.0
-    return float(data.get("available_capital", data.get("total", 0)) or 0)
-
-
-def wait_until(predicate, timeout: float, label: str) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            if predicate():
-                return True
-        except Exception as e:
-            logger.warning("Settle poll (%s) error: %s", label, e)
-        time.sleep(SETTLE_POLL)
-    return False
-
-
-def sell_usd(pair: str, target_usd: float) -> dict:
-    """Sell newest-first until ~target_usd of the pair is exited. Market orders."""
-    trades, coins, usd = position_usd(pair)
-    if not trades or usd <= 0:
-        raise RuntimeError(f"no open {pair} trade to sell")
-
-    remaining = min(target_usd, usd)
-    sold_usd = 0.0
-    sold_coins = 0.0
-    fills = []
-
-    for trade in trades:
-        if remaining < MIN_STAKE * 0.5:
-            break
-        trade_id = str(trade["trade_id"])
-        amount = float(trade["amount"])
-        rate = trade_rate(trade)
-        if rate <= 0 or amount <= 0:
-            continue
-        trade_usd = amount * rate
-        this_usd = min(remaining, trade_usd)
-        this_coins = this_usd / rate
-        if this_coins > amount * 0.999:
-            this_coins = amount
-            this_usd = amount * rate
-
-        logger.info("FORCESELL %s trade_id=%s coins=%.8f (~$%.2f)", pair, trade_id, this_coins, this_usd)
-        _ft_request(
-            "POST",
-            "/forcesell",
-            json={"tradeid": trade_id, "ordertype": "market", "amount": this_coins},
-        )
-
-        prev_amount = amount
-        settled = wait_until(
-            lambda: (
-                (get_open_trades(pair) == [] and True)
-                or any(
-                    str(t["trade_id"]) == trade_id and float(t["amount"]) < prev_amount * 0.999
-                    for t in get_open_trades(pair)
-                )
-                or all(str(t["trade_id"]) != trade_id for t in get_open_trades(pair))
-            ),
-            SETTLE_TIMEOUT,
-            f"sell {pair} {trade_id}",
-        )
-        if not settled:
-            logger.warning("Sell settle timed out for %s trade %s — continuing with estimate", pair, trade_id)
-
-        sold_usd += this_usd
-        sold_coins += this_coins
-        remaining -= this_usd
-        fills.append({"trade_id": trade_id, "coins": this_coins, "usd": this_usd, "rate": rate})
-
-    if sold_usd <= 0:
-        raise RuntimeError(f"sold $0 of {pair}")
-    return {"sold_usd": sold_usd, "sold_coins": sold_coins, "fills": fills}
-
-
-def buy_usd(pair: str, stake: float) -> dict:
-    if stake < MIN_STAKE:
-        raise RuntimeError(f"buy stake ${stake:.2f} below ${MIN_STAKE:.0f} minimum")
-    available = get_available_capital()
-    if available + 1e-6 < MIN_STAKE:
-        raise RuntimeError(f"available capital ${available:.2f} too low to buy {pair}")
-    use = round(min(stake, available), 2)
-    if use < MIN_STAKE:
-        raise RuntimeError(f"clamped stake ${use:.2f} below minimum")
-    logger.info("FORCEBUY %s stake=$%.2f (available=$%.2f)", pair, use, available)
-    result = _ft_request("POST", "/forcebuy", json={"pair": pair, "stake_amount": use})
-    if not isinstance(result, dict):
-        result = {"raw": result}
-    return {"stake": use, "result": result}
 
 
 def apply_book_rotation(side: str, sell_symbol: str, buy_symbol: str, sold_coins: float, sold_usd: float, bought_usd: float):
@@ -301,6 +377,7 @@ def apply_book_rotation(side: str, sell_symbol: str, buy_symbol: str, sold_coins
                 "sold_coins": sold_coins,
                 "sold_usd": round(sold_usd, 2),
                 "bought_usd": round(bought_usd, 2),
+                "dry_run": DRY_RUN,
             }
         )
         book["history"] = book["history"][-200:]
@@ -325,60 +402,61 @@ def execute_rotate(side: str) -> dict:
     if side not in ("long", "short"):
         raise ValueError("side must be long or short")
 
-    # Long on BASE/QUOTE ratio → BASE stronger → sell QUOTE, buy BASE
     if side == "long":
         sell_symbol, buy_symbol = ROTATE_QUOTE, ROTATE_BASE
-        sell_pair, buy_pair = quote_pair(), base_pair()
     else:
         sell_symbol, buy_symbol = ROTATE_BASE, ROTATE_QUOTE
-        sell_pair, buy_pair = base_pair(), quote_pair()
 
-    trades, coins, usd = position_usd(sell_pair)
+    coins, usd = position(sell_symbol)
     target = usd * ROTATE_RATIO
     preview = {
         "side": side,
+        "venue": "hyperliquid",
+        "dry_run": DRY_RUN,
         "ratio_pair": ratio_pair(),
-        "sell_pair": sell_pair,
-        "buy_pair": buy_pair,
+        "sell": sell_symbol,
+        "buy": buy_symbol,
         "sell_usd": round(usd, 2),
         "sell_coins": coins,
         "target_usd": round(target, 2),
         "ratio": ROTATE_RATIO,
+        "usdc_free": round(usdc_free(), 2),
     }
 
-    if usd <= 0 or not trades:
-        msg = f"IADSS ROTATE skipped — {side.upper()} {ratio_pair()}\nNo open {sell_pair} trade to rotate from"
+    if usd <= 0 or coins <= 0:
+        msg = f"IADSS ROTATE skipped — {side.upper()} {ratio_pair()}\nNo free {sell_symbol} spot on Hyperliquid sub"
         logger.warning(msg)
         telegram(msg)
-        return {"status": "skipped", "reason": f"no open {sell_pair} trade", **preview}
+        return {"status": "skipped", "reason": f"no free {sell_symbol}", **preview}
 
     if target < MIN_STAKE:
         msg = (
             f"IADSS ROTATE skipped — {side.upper()} {ratio_pair()}\n"
-            f"{int(ROTATE_RATIO*100)}% of {sell_pair} is ${target:.2f} (min ${MIN_STAKE:.0f})"
+            f"{int(ROTATE_RATIO*100)}% of {sell_symbol} is ${target:.2f} (min ${MIN_STAKE:.0f})"
         )
         logger.warning(msg)
         telegram(msg)
         return {"status": "skipped", "reason": "below minimum", **preview}
 
+    mode = "DRY RUN " if DRY_RUN else ""
     telegram(
-        f"IADSS ROTATE {side.upper()} — {ratio_pair()}\n"
-        f"Selling ${target:.2f} of {sell_pair} ({int(ROTATE_RATIO*100)}%) → buying {buy_pair}"
+        f"IADSS ROTATE {mode}{side.upper()} — {ratio_pair()} (Hyperliquid spot)\n"
+        f"Selling ${target:.2f} of {sell_symbol} ({int(ROTATE_RATIO*100)}%) → buying {buy_symbol}"
     )
 
-    sell_info = sell_usd(sell_pair, target)
+    sell_info = sell_usd(sell_symbol, target)
     sold_usd = float(sell_info["sold_usd"])
     fee = sold_usd * (FEE_BPS / 10_000.0)
-    buy_stake = round(max(0.0, sold_usd - fee), 2)
+    buy_stake = max(0.0, sold_usd - fee)
 
-    # Give Freqtrade a beat to credit free capital after the market sell.
-    wait_until(lambda: get_available_capital() >= min(buy_stake, MIN_STAKE), min(SETTLE_TIMEOUT, 20), "capital")
+    if not DRY_RUN:
+        wait_until(lambda: usdc_free() >= min(buy_stake * 0.95, MIN_STAKE), SETTLE_TIMEOUT, "usdc after sell")
 
     buy_info = None
     buy_error = None
     try:
-        buy_info = buy_usd(buy_pair, buy_stake)
-        bought_usd = float(buy_info["stake"])
+        buy_info = buy_usd(buy_symbol, buy_stake)
+        bought_usd = float(buy_info["bought_usd"])
     except Exception as e:
         buy_error = str(e)
         bought_usd = 0.0
@@ -390,8 +468,8 @@ def execute_rotate(side: str) -> dict:
         msg = (
             f"IADSS ROTATE PARTIAL — {side.upper()} {ratio_pair()}\n"
             f"SOLD {sell_info['sold_coins']:.6f} {sell_symbol} (~${sold_usd:.2f})\n"
-            f"BUY {buy_pair} FAILED: {buy_error}\n"
-            f"USD is sitting as free capital — buy manually or retry"
+            f"BUY {buy_symbol} FAILED: {buy_error}\n"
+            f"{STAKE_CURRENCY} is sitting in the HL sub — buy manually or retry"
         )
         telegram(msg)
         return {
@@ -401,47 +479,70 @@ def execute_rotate(side: str) -> dict:
             "sold_usd": round(sold_usd, 2),
             "sold_coins": sell_info["sold_coins"],
             "bought_usd": 0,
-            "sell_fills": sell_info["fills"],
         }
 
-    trade_id = (buy_info or {}).get("result", {}).get("trade_id") or (buy_info or {}).get("result", {}).get("id", "?")
     msg = (
-        f"IADSS ROTATE executed — {side.upper()} {ratio_pair()}\n"
+        f"IADSS ROTATE {mode}executed — {side.upper()} {ratio_pair()}\n"
         f"Sold: {sell_info['sold_coins']:.6f} {sell_symbol}  ${sold_usd:.2f}\n"
         f"Bought: {buy_symbol}  ${bought_usd:.2f}\n"
-        f"Buy trade: {trade_id}"
+        f"Venue: Hyperliquid spot{' (dry run)' if DRY_RUN else ''}"
     )
     telegram(msg)
     logger.info(msg.replace("\n", " | "))
     return {
-        "status": "rotated",
+        "status": "dry_run" if DRY_RUN else "rotated",
         **preview,
         "sold_usd": round(sold_usd, 2),
         "sold_coins": sell_info["sold_coins"],
         "bought_usd": round(bought_usd, 2),
-        "buy_trade_id": trade_id,
-        "sell_fills": sell_info["fills"],
     }
 
 
 def preview_rotate(side: str) -> dict:
     side = side.lower()
-    if side == "long":
-        sell_pair, buy_pair = quote_pair(), base_pair()
-    else:
-        sell_pair, buy_pair = base_pair(), quote_pair()
-    _trades, coins, usd = position_usd(sell_pair)
+    sell_symbol = ROTATE_QUOTE if side == "long" else ROTATE_BASE
+    buy_symbol = ROTATE_BASE if side == "long" else ROTATE_QUOTE
+    coins, usd = position(sell_symbol)
     target = usd * ROTATE_RATIO
     return {
         "side": side,
+        "venue": "hyperliquid",
+        "dry_run": DRY_RUN,
         "ratio_pair": ratio_pair(),
-        "sell_pair": sell_pair,
-        "buy_pair": buy_pair,
+        "sell": sell_symbol,
+        "buy": buy_symbol,
         "position_usd": round(usd, 2),
         "position_coins": coins,
         "target_usd": round(target, 2),
         "would_skip": usd <= 0 or target < MIN_STAKE,
-        "available_capital": round(get_available_capital(), 2),
+        "usdc_free": round(usdc_free(), 2),
+        "mids": {ROTATE_BASE: mid_px(ROTATE_BASE), ROTATE_QUOTE: mid_px(ROTATE_QUOTE)},
+    }
+
+
+def live_snapshot() -> dict:
+    base_coins, base_usd = position(ROTATE_BASE)
+    quote_coins, quote_usd = position(ROTATE_QUOTE)
+    total = base_usd + quote_usd
+    cash = usdc_free()
+    return {
+        ROTATE_BASE: {
+            "coins": base_coins,
+            "usd": round(base_usd, 2),
+            "px": mid_px(ROTATE_BASE),
+            "weight_pct": round(base_usd / total * 100, 2) if total else 0,
+            "spot": spot_name(ROTATE_BASE),
+        },
+        ROTATE_QUOTE: {
+            "coins": quote_coins,
+            "usd": round(quote_usd, 2),
+            "px": mid_px(ROTATE_QUOTE),
+            "weight_pct": round(quote_usd / total * 100, 2) if total else 0,
+            "spot": spot_name(ROTATE_QUOTE),
+        },
+        "total_usd": round(total, 2),
+        "usdc_free": round(cash, 2),
+        "subaccount": query_address(),
     }
 
 
@@ -476,7 +577,10 @@ def parse_side(default: str | None = None) -> str:
 @require_token
 def confirm_long():
     logger.info("LONG early warning: %s", ratio_pair())
-    telegram(f"IADSS ROTATE Early Warning — LONG {ratio_pair()}\n{ROTATE_BASE} looking stronger — waiting for sequence complete")
+    telegram(
+        f"IADSS ROTATE Early Warning — LONG {ratio_pair()}\n"
+        f"{ROTATE_BASE} looking stronger — waiting for sequence complete"
+    )
     return jsonify({"status": "ok", "message": "early_warning", "side": "long"}), 200
 
 
@@ -485,7 +589,10 @@ def confirm_long():
 @require_token
 def confirm_short():
     logger.info("SHORT early warning: %s", ratio_pair())
-    telegram(f"IADSS ROTATE Early Warning — SHORT {ratio_pair()}\n{ROTATE_QUOTE} looking stronger — waiting for sequence complete")
+    telegram(
+        f"IADSS ROTATE Early Warning — SHORT {ratio_pair()}\n"
+        f"{ROTATE_QUOTE} looking stronger — waiting for sequence complete"
+    )
     return jsonify({"status": "ok", "message": "early_warning", "side": "short"}), 200
 
 
@@ -495,7 +602,7 @@ def confirm_short():
 def rotate_long():
     try:
         result = execute_rotate("long")
-        code = 200 if result.get("status") in ("rotated", "skipped") else 207
+        code = 200 if result.get("status") in ("rotated", "skipped", "dry_run") else 207
         return jsonify(result), code
     except Exception as e:
         logger.error("rotate-long failed: %s", e)
@@ -509,7 +616,7 @@ def rotate_long():
 def rotate_short():
     try:
         result = execute_rotate("short")
-        code = 200 if result.get("status") in ("rotated", "skipped") else 207
+        code = 200 if result.get("status") in ("rotated", "skipped", "dry_run") else 207
         return jsonify(result), code
     except Exception as e:
         logger.error("rotate-short failed: %s", e)
@@ -524,7 +631,7 @@ def rotate():
     try:
         side = parse_side()
         result = execute_rotate(side)
-        code = 200 if result.get("status") in ("rotated", "skipped") else 207
+        code = 200 if result.get("status") in ("rotated", "skipped", "dry_run") else 207
         return jsonify(result), code
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -554,31 +661,13 @@ def book_view():
     try:
         with _book_lock:
             book = _load_book()
-        base_t, base_coins, base_usd = position_usd(base_pair())
-        quote_t, quote_coins, quote_usd = position_usd(quote_pair())
-        total = base_usd + quote_usd
         return jsonify(
             {
                 "status": "ok",
+                "venue": "hyperliquid",
+                "dry_run": DRY_RUN,
                 "ratio_pair": ratio_pair(),
-                "live": {
-                    ROTATE_BASE: {
-                        "pair": base_pair(),
-                        "open_trades": len(base_t),
-                        "coins": base_coins,
-                        "usd": round(base_usd, 2),
-                        "weight_pct": round(base_usd / total * 100, 2) if total else 0,
-                    },
-                    ROTATE_QUOTE: {
-                        "pair": quote_pair(),
-                        "open_trades": len(quote_t),
-                        "coins": quote_coins,
-                        "usd": round(quote_usd, 2),
-                        "weight_pct": round(quote_usd / total * 100, 2) if total else 0,
-                    },
-                    "total_usd": round(total, 2),
-                    "available_capital": round(get_available_capital(), 2),
-                },
+                "live": live_snapshot(),
                 "book": book,
             }
         )
@@ -607,18 +696,47 @@ def book_seed():
         return jsonify({"error": str(e)}), 400
 
 
+@app.route("/book/sync", methods=["POST"])
+@limiter.limit("20 per minute")
+@require_token
+def book_sync():
+    """Pull live Hyperliquid spot balances into the local book (cost from entryNtl)."""
+    try:
+        seeded = {}
+        for symbol in (ROTATE_BASE, ROTATE_QUOTE):
+            bal = balance_of(symbol)
+            coins = float(bal["total"])
+            cost = float(bal["entry_ntl"] or 0)
+            if cost <= 0 and coins > 0:
+                cost = coins * mid_px(symbol)
+            seeded[symbol] = seed_asset(symbol, coins, cost)
+        telegram(f"IADSS ROTATE SYNC from Hyperliquid spot\n{json.dumps(seeded)}")
+        return jsonify({"status": "ok", "assets": seeded, "live": live_snapshot()})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify(
         {
             "status": "ok",
             "service": "iadss-rotation-tracker",
+            "venue": "hyperliquid",
+            "network": HL_NETWORK,
             "ratio_pair": ratio_pair(),
             "ratio": ROTATE_RATIO,
+            "dry_run": DRY_RUN,
+            "subaccount_configured": bool(HL_SUBACCOUNT_ADDRESS),
         }
     )
 
 
 if __name__ == "__main__":
-    logger.info("IADSS Rotation Tracker starting — %s ratio=%.2f", ratio_pair(), ROTATE_RATIO)
+    logger.info(
+        "IADSS Rotation Tracker starting — %s ratio=%.2f venue=hyperliquid dry_run=%s",
+        ratio_pair(),
+        ROTATE_RATIO,
+        DRY_RUN,
+    )
     app.run(host="0.0.0.0", port=5000)

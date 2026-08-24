@@ -1,57 +1,26 @@
-# Unraid / home server — own Freqtrade + rotation tracker.
-# Joins your existing Cloudflare tunnel network for HTTPS hostnames only.
-# Still uses THIS stack's rotation-freqtrade, never the IADSS freqtrade container.
+# Unraid / home server — Hyperliquid spot rotator only.
+# Joins your existing Cloudflare tunnel network for HTTPS.
+# Does not start Freqtrade and does not talk to IADSS.
 #
-# Setup:
-#   1. Kraken subaccount + API key (Query + Create/Modify orders, no withdraw)
-#   2. cp .env.example .env  and fill SECRET_TOKEN, FREQTRADE_PASS, DOCKER_NETWORK
-#   3. Put the subaccount key/secret in user_data/config.json
-#   4. docker compose -f docker-compose.selfhosted.yml up -d
-#
-# Unraid auto-start in /boot/config/go:
+# /boot/config/go:
 #   cd /mnt/user/appdata/IADSS-Rotation-Tracker && docker compose -f docker-compose.selfhosted.yml up -d
 #
-# Cloudflare public hostnames (same tunnel as IADSS, different services):
-#   rotate.yourdomain.com        →  http://rotation-tracker:5000
-#   rotate-trade.yourdomain.com  →  http://rotation-freqtrade:8080
+# Cloudflare:
+#   rotate.yourdomain.com  →  http://rotation-tracker:5000
 
 services:
-  rotation-freqtrade:
-    image: freqtradeorg/freqtrade:stable
-    container_name: rotation-freqtrade
-    restart: unless-stopped
-    networks:
-      - rotation
-      - tunnel_network
-    volumes:
-      - ./user_data:/freqtrade/user_data
-    command: >
-      trade
-      --logfile /freqtrade/user_data/logs/freqtrade.log
-      --db-url sqlite:////freqtrade/user_data/tradesv3.sqlite
-      --config /freqtrade/user_data/config.json
-      --strategy WebhookStrategy
-
   rotation-tracker:
     build: .
     container_name: rotation-tracker
     restart: unless-stopped
     networks:
-      - rotation
       - tunnel_network
     ports:
       - "5002:5000"
     env_file:
       - .env
-    environment:
-      - FREQTRADE_API=http://rotation-freqtrade:8080/api/v1
-      - FREQTRADE_USER=admin
-      - FREQTRADE_PASS=${FREQTRADE_PASS}
     volumes:
       - ./data:/data
-    depends_on:
-      rotation-freqtrade:
-        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
       interval: 30s
@@ -59,7 +28,6 @@ services:
       retries: 3
 
 networks:
-  rotation:
   tunnel_network:
     name: ${DOCKER_NETWORK}
     external: true

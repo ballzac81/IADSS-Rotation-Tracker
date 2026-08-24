@@ -1,35 +1,3 @@
-# NOT RECOMMENDED.
-# Talks to an existing Freqtrade (IADSS) and therefore the same Kraken wallet.
-# SOL / HYPE / TAO IADSS ledgers and the rotation book will share free USD
-# and can sell each other's open HYPE/SOL trades.
-#
-# Use docker-compose.yml or docker-compose.selfhosted.yml with a Kraken
-# subaccount instead.
-
-services:
-  rotation-tracker:
-    build: .
-    container_name: rotation-tracker
-    restart: unless-stopped
-    networks:
-      - tunnel_network
-    ports:
-      - "5002:5000"
-    env_file:
-      - .env
-    environment:
-      - FREQTRADE_API=${FREQTRADE_API:-http://freqtrade:8080/api/v1}
-      - FREQTRADE_USER=${FREQTRADE_USER:-admin}
-      - FREQTRADE_PASS=${FREQTRADE_PASS}
-    volumes:
-      - ./data:/data
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-
-networks:
-  tunnel_network:
-    name: ${DOCKER_NETWORK}
-    external: true
+# REMOVED. This rotator no longer talks to Freqtrade or Kraken.
+# Use docker-compose.yml or docker-compose.selfhosted.yml.
+# IADSS (SOL/HYPE/TAO on Kraken) and PTOS (HL perps) stay on their own stacks.
