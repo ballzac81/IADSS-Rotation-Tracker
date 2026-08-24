@@ -1,19 +1,10 @@
-# Sidecar for an existing IADSS / Freqtrade stack (recommended on Unraid).
-# Joins the same Docker network as your live freqtrade container.
-# Does NOT start a second Freqtrade — that would fight over the same exchange keys.
+# NOT RECOMMENDED.
+# Talks to an existing Freqtrade (IADSS) and therefore the same Kraken wallet.
+# SOL / HYPE / TAO IADSS ledgers and the rotation book will share free USD
+# and can sell each other's open HYPE/SOL trades.
 #
-# Prerequisites:
-#   1. IADSS-Signal-Tracker (or another Freqtrade) is already running
-#   2. Add HYPE/USD and SOL/USD to that Freqtrade pair_whitelist
-#   3. Keep dry_run: true until you have watched a few rotations
-#   4. Set DOCKER_NETWORK in .env to the network those containers share
-#   5. FREQTRADE_API=http://freqtrade:8080/api/v1  (container name of existing bot)
-#
-# Unraid auto-start — add to /boot/config/go:
-#   cd /mnt/user/appdata/IADSS-Rotation-Tracker && docker compose -f docker-compose.sidecar.yml up -d
-#
-# Cloudflare public hostname (same tunnel as IADSS):
-#   rotate.yourdomain.com  →  http://rotation-tracker:5000
+# Use docker-compose.yml or docker-compose.selfhosted.yml with a Kraken
+# subaccount instead.
 
 services:
   rotation-tracker:
@@ -30,11 +21,6 @@ services:
       - FREQTRADE_API=${FREQTRADE_API:-http://freqtrade:8080/api/v1}
       - FREQTRADE_USER=${FREQTRADE_USER:-admin}
       - FREQTRADE_PASS=${FREQTRADE_PASS}
-      - ROTATE_BASE=${ROTATE_BASE:-HYPE}
-      - ROTATE_QUOTE=${ROTATE_QUOTE:-SOL}
-      - STAKE_CURRENCY=${STAKE_CURRENCY:-USD}
-      - ROTATE_RATIO=${ROTATE_RATIO:-0.5}
-      - MIN_STAKE=${MIN_STAKE:-10}
     volumes:
       - ./data:/data
     healthcheck:

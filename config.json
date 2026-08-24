@@ -33,8 +33,8 @@
     },
     "exchange": {
         "name": "kraken",
-        "key": "YOUR_EXCHANGE_API_KEY",
-        "secret": "YOUR_EXCHANGE_API_SECRET",
+        "key": "KRAKEN_SUBACCOUNT_API_KEY",
+        "secret": "KRAKEN_SUBACCOUNT_API_SECRET",
         "pair_whitelist": [
             "HYPE/USD",
             "SOL/USD"

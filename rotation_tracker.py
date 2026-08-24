@@ -38,7 +38,7 @@ def valid_pair(pair: str) -> bool:
 
 
 SECRET_TOKEN = os.environ.get("SECRET_TOKEN", "")
-FREQTRADE_API = os.environ.get("FREQTRADE_API", "http://freqtrade:8080/api/v1")
+FREQTRADE_API = os.environ.get("FREQTRADE_API", "http://rotation-freqtrade:8080/api/v1")
 FREQTRADE_USER = os.environ.get("FREQTRADE_USER", "admin")
 FREQTRADE_PASS = os.environ.get("FREQTRADE_PASS", "")
 TG_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")

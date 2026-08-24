@@ -1,8 +1,9 @@
-# Standalone stack — only use this if you are NOT already running IADSS-Signal-Tracker.
-# If IADSS is already live, use docker-compose.sidecar.yml instead (one Freqtrade).
+# IADSS Rotation Tracker — own Freqtrade on a dedicated Kraken subaccount.
+# Do NOT point this at the live IADSS API keys. IADSS keeps SOL / HYPE / TAO
+# independent on the main account; this stack is the separate HYPE/SOL sleeve.
 
 services:
-  freqtrade:
+  rotation-freqtrade:
     image: freqtradeorg/freqtrade:stable
     container_name: rotation-freqtrade
     restart: unless-stopped
@@ -26,13 +27,13 @@ services:
     env_file:
       - .env
     environment:
-      - FREQTRADE_API=http://freqtrade:8080/api/v1
+      - FREQTRADE_API=http://rotation-freqtrade:8080/api/v1
       - FREQTRADE_USER=admin
       - FREQTRADE_PASS=${FREQTRADE_PASS}
     volumes:
       - ./data:/data
     depends_on:
-      freqtrade:
+      rotation-freqtrade:
         condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]

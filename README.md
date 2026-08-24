@@ -1,10 +1,10 @@
 # IADSS Rotation Tracker
 
-Pair rotator for the [IADSS Confluence Monitor](https://www.tradingview.com/script/GzeIM5db-IADSS-Confluence-Monitor/). Forked in spirit from [IADSS-Signal-Tracker](https://github.com/ballzac81/IADSS-Signal-Tracker) — same webhook auth, Telegram, Freqtrade, Unraid sidecar — but it does **not** treat pairs as isolated bankrolls.
+Pair rotator for the [IADSS Confluence Monitor](https://www.tradingview.com/script/GzeIM5db-IADSS-Confluence-Monitor/). Same webhook / Telegram / Unraid style as [IADSS-Signal-Tracker](https://github.com/ballzac81/IADSS-Signal-Tracker), but a **separate Freqtrade** on a **Kraken subaccount**.
 
-It rotates **USD value** between two spot assets you want to keep long.
+IADSS keeps SOL, HYPE, and TAO independent on the main account. This repo is only the HYPE/SOL rotation sleeve.
 
-> **Spot only. Never shorts.** A Long/Short label is the ratio direction, not a leveraged short.
+> **Spot only. Never shorts.** Long/Short is the ratio direction, not a leveraged short.
 
 ## How a rotation works
 
@@ -25,6 +25,17 @@ Example starting book: `$5,000 HYPE` + `$5,000 SOL`.
 
 You stay long both the whole time. Only the mix changes.
 
+## Keep the books separate
+
+| Sleeve | Kraken | Freqtrade | Signals |
+|--------|--------|-----------|---------|
+| IADSS independent | Main account | Existing `freqtrade` | SOL / HYPE / TAO pair alerts |
+| HYPE/SOL rotation | **Subaccount** | `rotation-freqtrade` (this repo) | Ratio-chart Long / Short only |
+
+Kraken extra API keys on the **same** account still share balances. Subaccounts do not.
+
+Do **not** run `docker-compose.sidecar.yml` against live IADSS. That file is left only as a warning.
+
 ## Endpoints
 
 | Endpoint | Method | Action |
@@ -43,7 +54,7 @@ Auth is the same as IADSS: `token` in JSON body (preferred), `?token=`, or `X-To
 
 ## TradingView alerts
 
-Four alerts on the **ratio chart**, once per bar close.
+Four alerts on the **ratio chart**, once per bar close. Leave IADSS pair alerts on SOL/HYPE/TAO pointed at the original tracker.
 
 Webhook URL (Long complete):
 
@@ -59,71 +70,64 @@ Message body:
 
 Short complete → `/rotate-short` with `"side": "short"`.
 
-## Deploy next to live IADSS (recommended)
+## Setup (Kraken subaccount)
 
-Do **not** start a second Freqtrade against the same Kraken keys. Run this as a sidecar that talks to the Freqtrade you already have.
-
-1. Add both assets to the **existing** Freqtrade whitelist:
-
-```json
-"pair_whitelist": ["SOL/USD", "HYPE/USD"]
-```
-
-2. Keep `"dry_run": true` until you have watched rotations on `/book` and Telegram.
-
+1. On Kraken, create a subaccount. Generate an API key with **Query** + **Create and modify orders** only (never withdrawals).
+2. Transfer in only the rotation bankroll.
 3. Clone and configure:
 
 ```bash
 git clone https://github.com/ballzac81/IADSS-Rotation-Tracker.git
 cd IADSS-Rotation-Tracker
 cp .env.example .env
-```
-
-Set `SECRET_TOKEN`, `FREQTRADE_PASS`, `DOCKER_NETWORK` (the network `freqtrade` and your Cloudflare tunnel already share).
-
-4. Start:
-
-```bash
-docker compose -f docker-compose.sidecar.yml up -d
-```
-
-Unraid auto-start in `/boot/config/go`:
-
-```bash
-cd /mnt/user/appdata/IADSS-Rotation-Tracker && docker compose -f docker-compose.sidecar.yml up -d
-```
-
-5. Cloudflare tunnel public hostname:
-
-```
-rotate.yourdomain.com  →  http://rotation-tracker:5000
-```
-
-Host port is `5002` so it does not clash with IADSS (`5000`) or PTOS (`5001`).
-
-## Standalone (no existing Freqtrade)
-
-Only if this is the only bot:
-
-```bash
 mkdir -p user_data/strategies
 cp config.json user_data/
 cp strategies/WebhookStrategy.py user_data/strategies/
-# edit user_data/config.json placeholders
+```
+
+4. Edit `user_data/config.json`:
+   - Subaccount API key and secret
+   - `"dry_run": true` until you have watched rotations
+   - JWT secret, Freqtrade API password (must match `FREQTRADE_PASS` in `.env`)
+   - `pair_whitelist`: `HYPE/USD`, `SOL/USD` only
+5. Generate `SECRET_TOKEN` (`openssl rand -hex 24`) and put it in `.env`.
+
+VPS:
+
+```bash
 docker compose up -d
 ```
 
+Unraid (own Freqtrade, Cloudflare tunnel for HTTPS only):
+
+```bash
+docker compose -f docker-compose.selfhosted.yml up -d
+```
+
+`/boot/config/go`:
+
+```bash
+cd /mnt/user/appdata/IADSS-Rotation-Tracker && docker compose -f docker-compose.selfhosted.yml up -d
+```
+
+Cloudflare public hostnames (same tunnel as IADSS, **different containers**):
+
+```
+rotate.yourdomain.com        →  http://rotation-tracker:5000
+rotate-trade.yourdomain.com  →  http://rotation-freqtrade:8080
+```
+
+Ports `5002` (tracker) and `8068` (Freqtrade UI) so they do not clash with IADSS.
+
 ## Seed existing holdings
 
-Freqtrade must already have **open trades** on both pairs for sells to work (same rule as IADSS). If you already hold coins, force-enter or buy a starter size on each pair in dry-run, then:
+This Freqtrade must have **open trades** on both pairs for sells to work. After a starter buy on each side in dry-run:
 
 ```bash
 curl -X POST https://rotate.yourdomain.com/book/seed \
   -H "Content-Type: application/json" \
   -d '{"symbol":"HYPE","coins":12.5,"cost_usd":1000,"token":"YOUR_SECRET_TOKEN"}'
 ```
-
-Check what the next Long would do:
 
 ```bash
 curl "https://rotate.yourdomain.com/preview?side=long&token=YOUR_SECRET_TOKEN"
@@ -147,6 +151,7 @@ curl "https://rotate.yourdomain.com/preview?side=long&token=YOUR_SECRET_TOKEN"
 - Rate limit: 6/min on rotate, 30/min on early warning
 - Never enable withdrawal permissions on the exchange key
 - `.env` is gitignored
+- One Freqtrade per Kraken account/subaccount
 
 ## License
 
