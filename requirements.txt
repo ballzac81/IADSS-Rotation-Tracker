@@ -1,0 +1,4 @@
+flask==3.0.*
+flask-limiter==3.*
+requests==2.*
+gunicorn==23.*

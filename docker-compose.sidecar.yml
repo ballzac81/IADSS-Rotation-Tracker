@@ -1,0 +1,49 @@
+# Sidecar for an existing IADSS / Freqtrade stack (recommended on Unraid).
+# Joins the same Docker network as your live freqtrade container.
+# Does NOT start a second Freqtrade — that would fight over the same exchange keys.
+#
+# Prerequisites:
+#   1. IADSS-Signal-Tracker (or another Freqtrade) is already running
+#   2. Add HYPE/USD and SOL/USD to that Freqtrade pair_whitelist
+#   3. Keep dry_run: true until you have watched a few rotations
+#   4. Set DOCKER_NETWORK in .env to the network those containers share
+#   5. FREQTRADE_API=http://freqtrade:8080/api/v1  (container name of existing bot)
+#
+# Unraid auto-start — add to /boot/config/go:
+#   cd /mnt/user/appdata/IADSS-Rotation-Tracker && docker compose -f docker-compose.sidecar.yml up -d
+#
+# Cloudflare public hostname (same tunnel as IADSS):
+#   rotate.yourdomain.com  →  http://rotation-tracker:5000
+
+services:
+  rotation-tracker:
+    build: .
+    container_name: rotation-tracker
+    restart: unless-stopped
+    networks:
+      - tunnel_network
+    ports:
+      - "5002:5000"
+    env_file:
+      - .env
+    environment:
+      - FREQTRADE_API=${FREQTRADE_API:-http://freqtrade:8080/api/v1}
+      - FREQTRADE_USER=${FREQTRADE_USER:-admin}
+      - FREQTRADE_PASS=${FREQTRADE_PASS}
+      - ROTATE_BASE=${ROTATE_BASE:-HYPE}
+      - ROTATE_QUOTE=${ROTATE_QUOTE:-SOL}
+      - STAKE_CURRENCY=${STAKE_CURRENCY:-USD}
+      - ROTATE_RATIO=${ROTATE_RATIO:-0.5}
+      - MIN_STAKE=${MIN_STAKE:-10}
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  tunnel_network:
+    name: ${DOCKER_NETWORK}
+    external: true
